@@ -79,3 +79,63 @@ resource "aws_route_table_association" "private_rt_associations" {
   subnet_id      = aws_subnet.private_subnets[count.index].id
   route_table_id = aws_route_table.private_route_table.id
 }
+resource "aws_security_group" "app_sg" {
+  name   = "csye6225-app-sg"
+  vpc_id = aws_vpc.csye6225_vpc.id # Reference your existing VPC
+
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Add the port your application runs on (e.g., 8080)
+  ingress {
+    from_port   = 8080
+    to_port     = 8080
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "csye6225-app-sg"
+  }
+}
+resource "aws_instance" "app_instance" {
+  ami                    = var.ami_id # Replace with your custom AMI ID
+  instance_type          = "t2.micro"
+  vpc_security_group_ids = [aws_security_group.app_sg.id]
+  subnet_id              = aws_subnet.public_subnets[0].id # Reference a public subnet
+
+  root_block_device {
+    volume_size           = 25
+    volume_type           = "gp2"
+    delete_on_termination = true
+  }
+
+  tags = {
+    Name = "csye6225-ec2-instance"
+  }
+}

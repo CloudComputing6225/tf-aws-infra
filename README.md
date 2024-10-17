@@ -29,6 +29,22 @@ Add terraform.tfvars and update the configurations
 
 To destroy: `terraform destroy`
 
+
+# Assignment 4
+
+# Overview
+
+This project uses Terraform to create AWS infrastructure, including a VPC, subnets, route tables, security groups, and an EC2 instance with a custom AMI. The setup ensures that the instance hosts a web application securely.
+
+# Prerequisites
+
+AWS CLI configured with access credentials.
+
+Terraform (v1.0+).
+
+A custom AMI ID pre-configured with the application.
+
+
 # Author
 Saurabh Srivastava
 
