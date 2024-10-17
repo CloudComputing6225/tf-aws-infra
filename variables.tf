@@ -29,3 +29,8 @@ variable "vpc_name" {
   description = "Name for the VPC"
   type        = string
 }
+variable "ami_id" {
+  description = "The AMI ID for the EC2 instance"
+  type        = string
+}
+
