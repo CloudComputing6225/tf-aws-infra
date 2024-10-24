@@ -79,9 +79,11 @@ resource "aws_route_table_association" "private_rt_associations" {
   subnet_id      = aws_subnet.private_subnets[count.index].id
   route_table_id = aws_route_table.private_route_table.id
 }
+
+# Application Security Group (for EC2)
 resource "aws_security_group" "app_sg" {
   name   = "csye6225-app-sg"
-  vpc_id = aws_vpc.csye6225_vpc.id # Reference your existing VPC
+  vpc_id = aws_vpc.csye6225_vpc.id
 
   ingress {
     from_port   = 22
@@ -104,7 +106,6 @@ resource "aws_security_group" "app_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # Add the port your application runs on (e.g., 8080)
   ingress {
     from_port   = 8080
     to_port     = 8080
@@ -123,11 +124,37 @@ resource "aws_security_group" "app_sg" {
     Name = "csye6225-app-sg"
   }
 }
+
+# DB Security Group (for RDS)
+resource "aws_security_group" "db_sg" {
+  name   = "csye6225-db-sg"
+  vpc_id = aws_vpc.csye6225_vpc.id
+
+  ingress {
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [aws_security_group.app_sg.id] # Allow from app_sg
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "csye6225-db-sg"
+  }
+}
+
+# EC2 Instance
 resource "aws_instance" "app_instance" {
   ami                    = var.ami_id # Replace with your custom AMI ID
   instance_type          = "t2.micro"
   vpc_security_group_ids = [aws_security_group.app_sg.id]
-  subnet_id              = aws_subnet.public_subnets[0].id # Reference a public subnet
+  subnet_id              = aws_subnet.public_subnets[0].id
 
   root_block_device {
     volume_size           = 25
@@ -135,7 +162,69 @@ resource "aws_instance" "app_instance" {
     delete_on_termination = true
   }
 
+  # Pass database credentials via user data
+  user_data = <<-EOF
+    #!/bin/bash
+    DB_HOST=$(echo "${aws_db_instance.db_instance.address}")
+    echo "DB_HOST=$DB_HOST" >> /opt/app/.env
+    echo "DB_USER=${var.db_username}" >> /opt/app/.env
+    echo "DB_PASSWORD=${var.db_password}" >> /opt/app/.env
+    echo "DB_NAME=${var.db_name}" >> /opt/app/.env
+    echo "DB_DIALECT=mysql" >> /opt/app/.env
+    echo "PORT=8080" >> /opt/app/.env
+    chmod 644 /opt/app/.env
+    export $(grep -v '^#' /opt/app/.env | xargs)
+    systemctl restart webapp.service
+  EOF
+
   tags = {
     Name = "csye6225-ec2-instance"
+  }
+}
+
+# RDS Parameter Group
+resource "aws_db_parameter_group" "db_param_group" {
+  name   = "csye6225-db-param-group"
+  family = "mysql8.0"
+
+  parameter {
+    name  = "max_connections"
+    value = "100"
+  }
+
+  tags = {
+    Name = "csye6225-db-param-group"
+  }
+}
+
+# RDS Subnet Group (for private subnets)
+resource "aws_db_subnet_group" "db_subnet_group" {
+  name       = "csye6225-db-subnet-group"
+  subnet_ids = aws_subnet.private_subnets[*].id
+
+  tags = {
+    Name = "csye6225-db-subnet-group"
+  }
+}
+
+# RDS Instance
+resource "aws_db_instance" "db_instance" {
+  identifier             = "csye6225"
+  engine                 = "mysql"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 20
+  username               = var.db_username
+  password               = var.db_password
+  db_subnet_group_name   = aws_db_subnet_group.db_subnet_group.name
+  vpc_security_group_ids = [aws_security_group.db_sg.id]
+  parameter_group_name   = aws_db_parameter_group.db_param_group.name
+  publicly_accessible    = false
+  skip_final_snapshot    = true
+  multi_az               = false
+  db_name                = var.db_name
+  engine_version         = "8.0.39"
+
+  tags = {
+    Name = "csye6225-db-instance"
   }
 }
