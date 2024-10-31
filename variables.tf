@@ -48,3 +48,13 @@ variable "db_name" {
   description = "RDS database name"
   type        = string
 }
+
+variable "domain_name" {
+  description = "RDS database name"
+  type        = string
+}
+
+variable "route53_zone_id" {
+  description = "Route53 Hosted Zone ID"
+  type        = string
+}

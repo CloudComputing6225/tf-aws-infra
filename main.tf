@@ -134,7 +134,7 @@ resource "aws_security_group" "db_sg" {
     from_port       = 3306
     to_port         = 3306
     protocol        = "tcp"
-    security_groups = [aws_security_group.app_sg.id] # Allow from app_sg
+    security_groups = [aws_security_group.app_sg.id]
   }
 
   egress {
@@ -149,12 +149,141 @@ resource "aws_security_group" "db_sg" {
   }
 }
 
+# S3 Bucket
+resource "aws_s3_bucket" "app_bucket" {
+  bucket        = uuid()
+  force_destroy = true
+
+  tags = {
+    Name = "csye6225-app-bucket"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "bucket_encryption" {
+  bucket = aws_s3_bucket.app_bucket.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "bucket_lifecycle" {
+  bucket = aws_s3_bucket.app_bucket.id
+
+  rule {
+    id     = "transition-to-ia"
+    status = "Enabled"
+
+    transition {
+      days          = 30
+      storage_class = "STANDARD_IA"
+    }
+  }
+}
+
+# IAM Role for EC2
+resource "aws_iam_role" "ec2_s3_access_role" {
+  name = "EC2-S3-Access-Role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# IAM Policy for S3 access
+resource "aws_iam_policy" "s3_access_policy" {
+  name        = "S3-Access-Policy"
+  description = "Policy for EC2 to access S3"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:DeleteObject"
+        ]
+        Resource = "${aws_s3_bucket.app_bucket.arn}/*"
+      }
+    ]
+  })
+}
+
+# CloudWatch log group
+resource "aws_cloudwatch_log_group" "app_log_group" {
+  name              = "/opt/app/webapp"
+  retention_in_days = 30
+}
+
+# IAM Policy for CloudWatch logging
+resource "aws_iam_policy" "cloudwatch_logging_policy" {
+  name        = "CloudWatchLoggingPolicy"
+  description = "Allows EC2 instances to write logs to CloudWatch"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "logs:DescribeLogGroups",
+          "logs:DescribeLogStreams"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# Attach policies to role
+resource "aws_iam_role_policy_attachment" "s3_access_attachment" {
+  policy_arn = aws_iam_policy.s3_access_policy.arn
+  role       = aws_iam_role.ec2_s3_access_role.name
+}
+
+resource "aws_iam_role_policy_attachment" "cloudwatch_logging_attachment" {
+  policy_arn = aws_iam_policy.cloudwatch_logging_policy.arn
+  role       = aws_iam_role.ec2_s3_access_role.name
+}
+
+# CloudWatchAgentServerPolicy attachment
+data "aws_iam_policy" "cloudwatch_agent_server_policy" {
+  arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "cloudwatch_agent_policy_attachment" {
+  policy_arn = data.aws_iam_policy.cloudwatch_agent_server_policy.arn
+  role       = aws_iam_role.ec2_s3_access_role.name
+}
+
+# Instance Profile
+resource "aws_iam_instance_profile" "ec2_profile" {
+  name = "EC2-S3-Profile"
+  role = aws_iam_role.ec2_s3_access_role.name
+}
+
 # EC2 Instance
 resource "aws_instance" "app_instance" {
-  ami                    = var.ami_id # Replace with your custom AMI ID
+  ami                    = var.ami_id
   instance_type          = "t2.micro"
   vpc_security_group_ids = [aws_security_group.app_sg.id]
   subnet_id              = aws_subnet.public_subnets[0].id
+  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
 
   root_block_device {
     volume_size           = 25
@@ -162,7 +291,6 @@ resource "aws_instance" "app_instance" {
     delete_on_termination = true
   }
 
-  # Pass database credentials via user data
   user_data = <<-EOF
     #!/bin/bash
     DB_HOST=$(echo "${aws_db_instance.db_instance.address}")
@@ -172,8 +300,49 @@ resource "aws_instance" "app_instance" {
     echo "DB_NAME=${var.db_name}" >> /opt/app/.env
     echo "DB_DIALECT=mysql" >> /opt/app/.env
     echo "PORT=8080" >> /opt/app/.env
+    echo "S3_BUCKET_NAME=${aws_s3_bucket.app_bucket.id}" >> /opt/app/.env
+    echo "S3_BUCKET_URL=https://${aws_s3_bucket.app_bucket.bucket_regional_domain_name}" >> /opt/app/.env
+    echo "AWS_REGION=us-east-1" >> /opt/app/.env
     chmod 644 /opt/app/.env
     export $(grep -v '^#' /opt/app/.env | xargs)
+    sudo touch /opt/app/webapp.log
+    sudo chmod 644 /opt/app/webapp.log
+    sudo chown root:root /opt/app/webapp.log
+    # Add test log entry
+    echo "Test log entry: Instance started at $(date)" | sudo tee -a /opt/app/webapp.log
+    # Configure and start CloudWatch agent
+    cat <<EOT > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+    {
+      "agent": {
+        "metrics_collection_interval": 5,
+        "run_as_user": "root"
+      },
+      "logs": {
+        "logs_collected": {
+          "files": {
+            "collect_list": [
+              {
+                "file_path": "/opt/app/webapp.log",
+                "log_group_name": "csye6225",
+                "log_stream_name": "webapp"
+              }
+            ]
+          }
+        }
+      },
+      "metrics": {
+        "metrics_collected": {
+          "statsd": {
+            "service_address": ":8125",
+            "metrics_collection_interval": 5,
+            "metrics_aggregation_interval": 5
+          }
+        }
+      }
+    }
+    EOT
+    
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
     systemctl restart webapp.service
   EOF
 
@@ -228,3 +397,54 @@ resource "aws_db_instance" "db_instance" {
     Name = "csye6225-db-instance"
   }
 }
+
+# Route 53 A Record
+resource "aws_route53_record" "app_record" {
+  zone_id = var.route53_zone_id
+  name    = var.domain_name
+  type    = "A"
+  ttl     = 300
+  records = [aws_instance.app_instance.public_ip]
+}
+
+resource "aws_route53_record" "dkim" {
+  zone_id = var.route53_zone_id
+  name    = "mailo._domainkey.${var.domain_name}"
+  type    = "TXT"
+  ttl     = "300"
+  records = [
+    "k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCqJuOCyceEXAS2SwmuK/TQGVzdUaoBk0Mdb6PCwLISHuPz08p8TwJPsTJeUzkrq6Zb2oy9VcjozFx/+cfcKOnXsfDGYG6HmehPZz74jMcpq2SHjyTY5LbSpTDKmga9R8ewc/IoHk6jUcD7nXnW6ea4p+HVXoUI5L6uO7i7LKPQpwIDAQAB"
+  ]
+}
+
+resource "aws_route53_record" "spf" {
+  zone_id = var.route53_zone_id
+  name    = var.domain_name
+  type    = "TXT"
+  ttl     = "300"
+  records = [
+    "v=spf1 include:mailgun.org ~all"
+  ]
+}
+
+resource "aws_route53_record" "mx1" {
+  zone_id = var.route53_zone_id
+  name    = var.domain_name
+  type    = "MX"
+  ttl     = "300"
+  records = [
+    "10 mxa.mailgun.org"
+  ]
+}
+
+
+resource "aws_route53_record" "email_cname" {
+  zone_id = var.route53_zone_id
+  name    = "email.${var.domain_name}"
+  type    = "CNAME"
+  ttl     = "300"
+  records = [
+    "mailgun.org"
+  ]
+}
+
