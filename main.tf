@@ -80,17 +80,11 @@ resource "aws_route_table_association" "private_rt_associations" {
   route_table_id = aws_route_table.private_route_table.id
 }
 
-# Application Security Group (for EC2)
-resource "aws_security_group" "app_sg" {
-  name   = "csye6225-app-sg"
-  vpc_id = aws_vpc.csye6225_vpc.id
-
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+# Load Balancer Security Group
+resource "aws_security_group" "lb_sg" {
+  name        = "load-balancer-security-group"
+  description = "Security group for load balancer"
+  vpc_id      = aws_vpc.csye6225_vpc.id
 
   ingress {
     from_port   = 80
@@ -106,11 +100,35 @@ resource "aws_security_group" "app_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  ingress {
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "load-balancer-security-group"
+  }
+}
+
+# Application Security Group (for EC2)
+resource "aws_security_group" "app_sg" {
+  name   = "csye6225-app-sg"
+  vpc_id = aws_vpc.csye6225_vpc.id
+
+  ingress {
+    from_port       = 22
+    to_port         = 22
+    protocol        = "tcp"
+    security_groups = [aws_security_group.lb_sg.id]
+  }
+
+  ingress {
+    from_port       = 8080
+    to_port         = 8080
+    protocol        = "tcp"
+    security_groups = [aws_security_group.lb_sg.id]
   }
 
   egress {
@@ -232,6 +250,7 @@ resource "aws_cloudwatch_log_group" "app_log_group" {
 resource "aws_iam_policy" "cloudwatch_logging_policy" {
   name        = "CloudWatchLoggingPolicy"
   description = "Allows EC2 instances to write logs to CloudWatch"
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -277,78 +296,247 @@ resource "aws_iam_instance_profile" "ec2_profile" {
   role = aws_iam_role.ec2_s3_access_role.name
 }
 
-# EC2 Instance
-resource "aws_instance" "app_instance" {
-  ami                    = var.ami_id
+# Launch Template
+resource "aws_launch_template" "app_launch_template" {
+  name                   = "csye6225_asg"
+  image_id               = var.ami_id
   instance_type          = "t2.micro"
+  key_name               = "csye6225"
   vpc_security_group_ids = [aws_security_group.app_sg.id]
-  subnet_id              = aws_subnet.public_subnets[0].id
-  iam_instance_profile   = aws_iam_instance_profile.ec2_profile.name
 
-  root_block_device {
-    volume_size           = 25
-    volume_type           = "gp2"
-    delete_on_termination = true
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ec2_profile.name
   }
 
-  user_data = <<-EOF
-    #!/bin/bash
-    DB_HOST=$(echo "${aws_db_instance.db_instance.address}")
-    echo "DB_HOST=$DB_HOST" >> /opt/app/.env
-    echo "DB_USER=${var.db_username}" >> /opt/app/.env
-    echo "DB_PASSWORD=${var.db_password}" >> /opt/app/.env
-    echo "DB_NAME=${var.db_name}" >> /opt/app/.env
-    echo "DB_DIALECT=mysql" >> /opt/app/.env
-    echo "PORT=8080" >> /opt/app/.env
-    echo "S3_BUCKET_NAME=${aws_s3_bucket.app_bucket.id}" >> /opt/app/.env
-    echo "S3_BUCKET_URL=https://${aws_s3_bucket.app_bucket.bucket_regional_domain_name}" >> /opt/app/.env
-    echo "AWS_REGION=us-east-1" >> /opt/app/.env
-    chmod 644 /opt/app/.env
-    export $(grep -v '^#' /opt/app/.env | xargs)
-    sudo touch /opt/app/webapp.log
-    sudo chmod 644 /opt/app/webapp.log
-    sudo chown root:root /opt/app/webapp.log
-    # Add test log entry
-    echo "Test log entry: Instance started at $(date)" | sudo tee -a /opt/app/webapp.log
-    # Configure and start CloudWatch agent
-    cat <<EOT > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
-    {
-      "agent": {
-        "metrics_collection_interval": 5,
-        "run_as_user": "root"
-      },
-      "logs": {
-        "logs_collected": {
-          "files": {
-            "collect_list": [
+  user_data = base64encode(<<-EOF
+              #!/bin/bash
+              DB_HOST=$(echo "${aws_db_instance.db_instance.address}")
+              echo "DB_HOST=$DB_HOST" >> /opt/app/.env
+              echo "DB_USER=${var.db_username}" >> /opt/app/.env
+              echo "DB_PASSWORD=${var.db_password}" >> /opt/app/.env
+              echo "DB_NAME=${var.db_name}" >> /opt/app/.env
+              echo "DB_DIALECT=mysql" >> /opt/app/.env
+              echo "PORT=8080" >> /opt/app/.env
+              echo "S3_BUCKET_NAME=${aws_s3_bucket.app_bucket.id}" >> /opt/app/.env
+              echo "S3_BUCKET_URL=https://${aws_s3_bucket.app_bucket.bucket_regional_domain_name}" >> /opt/app/.env
+              echo "AWS_REGION=${var.region}" >> /opt/app/.env
+              chmod 644 /opt/app/.env
+              export $(grep -v '^#' /opt/app/.env | xargs)
+              sudo touch /opt/app/webapp.log
+              sudo chmod 644 /opt/app/webapp.log
+              sudo chown root:root /opt/app/webapp.log
+              echo "Test log entry: Instance started at $(date)" | sudo tee -a /opt/app/webapp.log
+              cat <<EOT > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
               {
-                "file_path": "/opt/app/webapp.log",
-                "log_group_name": "csye6225",
-                "log_stream_name": "webapp"
+                "agent": {
+                  "metrics_collection_interval": 5,
+                  "run_as_user": "root"
+                },
+                "logs": {
+                  "logs_collected": {
+                    "files": {
+                      "collect_list": [
+                        {
+                          "file_path": "/opt/app/webapp.log",
+                          "log_group_name": "csye6225",
+                          "log_stream_name": "webapp"
+                        }
+                      ]
+                    }
+                  }
+                },
+                "metrics": {
+                  "metrics_collected": {
+                    "statsd": {
+                      "service_address": ":8125",
+                      "metrics_collection_interval": 5,
+                      "metrics_aggregation_interval": 5
+                    }
+                  }
+                }
               }
-            ]
-          }
-        }
-      },
-      "metrics": {
-        "metrics_collected": {
-          "statsd": {
-            "service_address": ":8125",
-            "metrics_collection_interval": 5,
-            "metrics_aggregation_interval": 5
-          }
-        }
-      }
+              EOT
+              /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+              systemctl restart webapp.service
+              EOF
+  )
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name = "csye6225-ec2-instance"
     }
-    EOT
-    
-    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
-    systemctl restart webapp.service
-  EOF
+  }
+}
+
+# Auto Scaling Group configuration
+resource "aws_autoscaling_group" "app_asg" {
+  name                = "csye6225-asg"
+  vpc_zone_identifier = aws_subnet.public_subnets[*].id
+  launch_template {
+    id      = aws_launch_template.app_launch_template.id
+    version = "$Latest"
+  }
+  min_size          = 3
+  max_size          = 5
+  desired_capacity  = 4
+  target_group_arns = [aws_lb_target_group.app_tg.arn]
+
+  tag {
+    key                 = "Name"
+    value               = "csye6225-asg-instance"
+    propagate_at_launch = true
+  }
+}
+
+# Scale Up Policy when CPU utilization exceeds 9%
+resource "aws_autoscaling_policy" "scale_up" {
+  name                   = "scale-up"
+  autoscaling_group_name = aws_autoscaling_group.app_asg.name
+  policy_type            = "SimpleScaling"
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = 1
+  cooldown               = 60
+}
+
+resource "aws_cloudwatch_metric_alarm" "high_cpu_utilization" {
+  alarm_name          = "High-CPU-Utilization"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 9.0
+  alarm_description   = "This alarm triggers a scale-up action if CPU utilization exceeds 9%."
+  alarm_actions       = [aws_autoscaling_policy.scale_up.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.app_asg.name
+  }
+}
+
+# Scale Down Policy when CPU utilization falls below 7%
+resource "aws_autoscaling_policy" "scale_down" {
+  name                   = "scale-down"
+  autoscaling_group_name = aws_autoscaling_group.app_asg.name
+  policy_type            = "SimpleScaling"
+  adjustment_type        = "ChangeInCapacity"
+  scaling_adjustment     = -1
+  cooldown               = 60
+}
+
+resource "aws_cloudwatch_metric_alarm" "low_cpu_utilization" {
+  alarm_name          = "Low-CPU-Utilization"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = 1
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/EC2"
+  period              = 60
+  statistic           = "Average"
+  threshold           = 7.0
+  alarm_description   = "This alarm triggers a scale-down action if CPU utilization falls below 7%."
+  alarm_actions       = [aws_autoscaling_policy.scale_down.arn]
+
+  dimensions = {
+    AutoScalingGroupName = aws_autoscaling_group.app_asg.name
+  }
+}
+
+# Application Load Balancer
+resource "aws_lb" "app_lb" {
+  name               = "csye6225-lb"
+  internal           = false
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.lb_sg.id]
+  subnets            = aws_subnet.public_subnets[*].id
 
   tags = {
-    Name = "csye6225-ec2-instance"
+    Name = "csye6225-lb"
   }
+}
+
+resource "aws_lb_target_group" "app_tg" {
+  name     = "csye6225-tg"
+  port     = 8080
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.csye6225_vpc.id
+
+  health_check {
+    path                = "/healthz"
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    timeout             = 5
+    interval            = 30
+  }
+}
+
+resource "aws_lb_listener" "app_listener" {
+  load_balancer_arn = aws_lb.app_lb.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app_tg.arn
+  }
+}
+
+# Route53 DNS Update
+resource "aws_route53_record" "app_dns" {
+  zone_id = var.route53_zone_id
+  name    = var.domain_name
+  type    = "A"
+
+  alias {
+    name                   = aws_lb.app_lb.dns_name
+    zone_id                = aws_lb.app_lb.zone_id
+    evaluate_target_health = true
+  }
+}
+# DKIM TXT Record for email validation
+resource "aws_route53_record" "dkim" {
+  zone_id = var.route53_zone_id
+  name    = "mailo._domainkey.${var.domain_name}"
+  type    = "TXT"
+  ttl     = 300
+  records = [
+    "k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCqJuOCyceEXAS2SwmuK/TQGVzdUaoBk0Mdb6PCwLISHuPz08p8TwJPsTJeUzkrq6Zb2oy9VcjozFx/+cfcKOnXsfDGYG6HmehPZz74jMcpq2SHjyTY5LbSpTDKmga9R8ewc/IoHk6jUcD7nXnW6ea4p+HVXoUI5L6uO7i7LKPQpwIDAQAB"
+  ]
+}
+
+# SPF TXT Record for email sender policy
+resource "aws_route53_record" "spf" {
+  zone_id = var.route53_zone_id
+  name    = var.domain_name
+  type    = "TXT"
+  ttl     = 300
+  records = [
+    "v=spf1 include:mailgun.org ~all"
+  ]
+}
+
+# MX Records for email receiving
+resource "aws_route53_record" "mx1" {
+  zone_id = var.route53_zone_id
+  name    = var.domain_name
+  type    = "MX"
+  ttl     = 300
+  records = [
+    "10 mxa.mailgun.org",
+    "10 mxb.mailgun.org"
+  ]
+}
+
+# CNAME Record for email subdomain handling
+resource "aws_route53_record" "email_cname" {
+  zone_id = var.route53_zone_id
+  name    = "email.${var.domain_name}"
+  type    = "CNAME"
+  ttl     = 300
+  records = [
+    "mailgun.org"
+  ]
 }
 
 # RDS Parameter Group
@@ -380,71 +568,20 @@ resource "aws_db_subnet_group" "db_subnet_group" {
 resource "aws_db_instance" "db_instance" {
   identifier             = "csye6225"
   engine                 = "mysql"
+  engine_version         = "8.0.39"
   instance_class         = "db.t3.micro"
   allocated_storage      = 20
   username               = var.db_username
   password               = var.db_password
+  db_name                = var.db_name
   db_subnet_group_name   = aws_db_subnet_group.db_subnet_group.name
   vpc_security_group_ids = [aws_security_group.db_sg.id]
   parameter_group_name   = aws_db_parameter_group.db_param_group.name
   publicly_accessible    = false
   skip_final_snapshot    = true
   multi_az               = false
-  db_name                = var.db_name
-  engine_version         = "8.0.39"
 
   tags = {
     Name = "csye6225-db-instance"
   }
 }
-
-# Route 53 A Record
-resource "aws_route53_record" "app_record" {
-  zone_id = var.route53_zone_id
-  name    = var.domain_name
-  type    = "A"
-  ttl     = 300
-  records = [aws_instance.app_instance.public_ip]
-}
-
-resource "aws_route53_record" "dkim" {
-  zone_id = var.route53_zone_id
-  name    = "mailo._domainkey.${var.domain_name}"
-  type    = "TXT"
-  ttl     = "300"
-  records = [
-    "k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCqJuOCyceEXAS2SwmuK/TQGVzdUaoBk0Mdb6PCwLISHuPz08p8TwJPsTJeUzkrq6Zb2oy9VcjozFx/+cfcKOnXsfDGYG6HmehPZz74jMcpq2SHjyTY5LbSpTDKmga9R8ewc/IoHk6jUcD7nXnW6ea4p+HVXoUI5L6uO7i7LKPQpwIDAQAB"
-  ]
-}
-
-resource "aws_route53_record" "spf" {
-  zone_id = var.route53_zone_id
-  name    = var.domain_name
-  type    = "TXT"
-  ttl     = "300"
-  records = [
-    "v=spf1 include:mailgun.org ~all"
-  ]
-}
-
-resource "aws_route53_record" "mx1" {
-  zone_id = var.route53_zone_id
-  name    = var.domain_name
-  type    = "MX"
-  ttl     = "300"
-  records = [
-    "10 mxa.mailgun.org"
-  ]
-}
-
-
-resource "aws_route53_record" "email_cname" {
-  zone_id = var.route53_zone_id
-  name    = "email.${var.domain_name}"
-  type    = "CNAME"
-  ttl     = "300"
-  records = [
-    "mailgun.org"
-  ]
-}
-
