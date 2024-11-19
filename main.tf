@@ -295,6 +295,97 @@ resource "aws_iam_instance_profile" "ec2_profile" {
   name = "EC2-S3-Profile"
   role = aws_iam_role.ec2_s3_access_role.name
 }
+# SNS Topic for user registration
+resource "aws_sns_topic" "user_registration" {
+  name = "user-registration-topic"
+}
+
+# Lambda Function for email verification
+resource "aws_lambda_function" "email_verification" {
+  filename         = "/Users/saurabhsrivastava/Desktop/CloudAws/serverless.zip"
+  function_name    = "email-verification"
+  role             = aws_iam_role.lambda_exec.arn
+  handler          = "index.handler"
+  source_code_hash = filebase64sha256("/Users/saurabhsrivastava/Desktop/CloudAws/serverless.zip")
+  runtime          = "nodejs20.x"
+
+  environment {
+    variables = {
+      DB_HOST         = aws_db_instance.db_instance.address
+      DB_USER         = var.db_username
+      DB_PASSWORD     = var.db_password
+      DB_NAME         = var.db_name
+      MAILGUN_API_KEY = var.mailgun_api_key
+      MAILGUN_DOMAIN  = var.mailgun_domain
+      SNS_TOPIC_ARN   = aws_sns_topic.user_registration.arn
+    }
+  }
+}
+
+# IAM Role for Lambda
+resource "aws_iam_role" "lambda_exec" {
+  name = "lambda-email-verification-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# IAM Policy for Lambda
+resource "aws_iam_role_policy_attachment" "lambda_exec_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  role       = aws_iam_role.lambda_exec.name
+}
+
+# SNS Topic Subscription
+resource "aws_sns_topic_subscription" "user_registration_lambda" {
+  topic_arn = aws_sns_topic.user_registration.arn
+  protocol  = "lambda"
+  endpoint  = aws_lambda_function.email_verification.arn
+}
+
+# Lambda Permission for SNS
+resource "aws_lambda_permission" "allow_sns" {
+  statement_id  = "AllowSNSInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.email_verification.function_name
+  principal     = "sns.amazonaws.com"
+  source_arn    = aws_sns_topic.user_registration.arn
+}
+
+# Update EC2 IAM Role to allow SNS publish
+resource "aws_iam_role_policy_attachment" "ec2_sns_publish" {
+  policy_arn = aws_iam_policy.sns_publish_policy.arn
+  role       = aws_iam_role.ec2_s3_access_role.name
+}
+
+resource "aws_iam_policy" "sns_publish_policy" {
+  name        = "SNSPublishPolicy"
+  description = "Allows EC2 instances to publish to SNS"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sns:Publish"
+        ]
+        Resource = aws_sns_topic.user_registration.arn
+      }
+    ]
+  })
+}
+
 
 # Launch Template
 resource "aws_launch_template" "app_launch_template" {
@@ -320,6 +411,9 @@ resource "aws_launch_template" "app_launch_template" {
               echo "S3_BUCKET_NAME=${aws_s3_bucket.app_bucket.id}" >> /opt/app/.env
               echo "S3_BUCKET_URL=https://${aws_s3_bucket.app_bucket.bucket_regional_domain_name}" >> /opt/app/.env
               echo "AWS_REGION=${var.region}" >> /opt/app/.env
+              echo "SNS_TOPIC_ARN=${aws_sns_topic.user_registration.arn}" >> /opt/app/.env
+              echo "MAILGUN_API_KEY=${var.mailgun_api_key}" >> /opt/app/.env
+              echo "MAILGUN_DOMAIN=${var.mailgun_domain}" >> /opt/app/.env
               chmod 644 /opt/app/.env
               export $(grep -v '^#' /opt/app/.env | xargs)
               sudo touch /opt/app/webapp.log
@@ -377,9 +471,9 @@ resource "aws_autoscaling_group" "app_asg" {
     id      = aws_launch_template.app_launch_template.id
     version = "$Latest"
   }
-  min_size          = 3
-  max_size          = 5
-  desired_capacity  = 4
+  min_size          = 1
+  max_size          = 2
+  desired_capacity  = 1
   target_group_arns = [aws_lb_target_group.app_tg.arn]
 
   tag {
