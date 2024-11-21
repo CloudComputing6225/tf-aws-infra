@@ -87,17 +87,19 @@ resource "aws_security_group" "lb_sg" {
   vpc_id      = aws_vpc.csye6225_vpc.id
 
   ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    from_port        = 80
+    to_port          = 80
+    protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
   }
 
   ingress {
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    from_port        = 443
+    to_port          = 443
+    protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
   }
 
   egress {
@@ -302,11 +304,11 @@ resource "aws_sns_topic" "user_registration" {
 
 # Lambda Function for email verification
 resource "aws_lambda_function" "email_verification" {
-  filename         = "/Users/saurabhsrivastava/Desktop/CloudAws/serverless.zip"
+  filename         = var.lambda_zip_path
   function_name    = "email-verification"
   role             = aws_iam_role.lambda_exec.arn
   handler          = "index.handler"
-  source_code_hash = filebase64sha256("/Users/saurabhsrivastava/Desktop/CloudAws/serverless.zip")
+  source_code_hash = filebase64sha256(var.lambda_zip_path)
   runtime          = "nodejs20.x"
 
   environment {
