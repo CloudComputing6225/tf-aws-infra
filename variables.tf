@@ -67,3 +67,7 @@ variable "mailgun_domain" {
   description = "Mailgun Domain"
   type        = string
 }
+variable "lambda_zip_path" {
+  description = "The path to the Lambda function zip file"
+  type        = string
+}
