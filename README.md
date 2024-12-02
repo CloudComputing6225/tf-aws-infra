@@ -54,3 +54,8 @@ NUID: 002895225
 
 
 
+
+aws acm import-certificate \
+--certificate fileb:///Users/saurabhsrivastava/Desktop/SSL/dev.saurabhprojects.me\ \(1\)/certificate.crt \
+--private-key fileb:///Users/saurabhsrivastava/Desktop/SSL/dev.saurabhprojects.me\ \(1\)/private.key \
+--certificate-chain fileb:///Users/saurabhsrivastava/Desktop/SSL/dev.saurabhprojects.me\ \(1\)/ca_bundle.crt
