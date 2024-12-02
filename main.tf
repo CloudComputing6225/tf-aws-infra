@@ -87,14 +87,6 @@ resource "aws_security_group" "lb_sg" {
   vpc_id      = aws_vpc.csye6225_vpc.id
 
   ingress {
-    from_port        = 80
-    to_port          = 80
-    protocol         = "tcp"
-    cidr_blocks      = ["0.0.0.0/0"]
-    ipv6_cidr_blocks = ["::/0"]
-  }
-
-  ingress {
     from_port        = 443
     to_port          = 443
     protocol         = "tcp"
@@ -118,13 +110,6 @@ resource "aws_security_group" "lb_sg" {
 resource "aws_security_group" "app_sg" {
   name   = "csye6225-app-sg"
   vpc_id = aws_vpc.csye6225_vpc.id
-
-  ingress {
-    from_port       = 22
-    to_port         = 22
-    protocol        = "tcp"
-    security_groups = [aws_security_group.lb_sg.id]
-  }
 
   ingress {
     from_port       = 8080
@@ -184,7 +169,8 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "bucket_encryption
 
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.s3_key.arn
     }
   }
 }
@@ -271,6 +257,65 @@ resource "aws_iam_policy" "cloudwatch_logging_policy" {
   })
 }
 
+resource "aws_acm_certificate" "ssl_cert" {
+  domain_name       = var.domain_name
+  validation_method = "DNS"
+
+  tags = {
+    Name = "csye6225-ssl-cert"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+# KMS Key for Secret Manager
+resource "aws_kms_key" "secret_manager_key" {
+  description             = "KMS key for Secret Manager"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
+  rotation_period_in_days = 90
+  tags = {
+    Name = "csye6225-secret-manager-kms-key"
+  }
+}
+
+# KMS Key for Email Service
+resource "aws_kms_key" "email_service_key" {
+  description             = "KMS key for Email Service"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
+  rotation_period_in_days = 90
+  tags = {
+    Name = "csye6225-email-service-kms-key"
+  }
+}
+
+# Secret for RDS Database Password
+resource "aws_secretsmanager_secret" "db_password" {
+  name        = "new-csye6225-db-password6"
+  description = "RDS Database Password"
+  kms_key_id  = aws_kms_key.secret_manager_key.arn
+}
+
+
+resource "aws_secretsmanager_secret_version" "db_password" {
+  secret_id     = aws_secretsmanager_secret.db_password.id
+  secret_string = var.db_password
+}
+
+# Secret for Email Service Credentials
+resource "aws_secretsmanager_secret" "email_credentials" {
+  name        = "new-csye6225-email-credentials6"
+  description = "Email Service Credentials"
+  kms_key_id  = aws_kms_key.email_service_key.arn
+}
+
+resource "aws_secretsmanager_secret_version" "email_credentials" {
+  secret_id     = aws_secretsmanager_secret.email_credentials.id
+  secret_string = var.mailgun_api_key
+  # domain  = var.mailgun_domain
+}
 # Attach policies to role
 resource "aws_iam_role_policy_attachment" "s3_access_attachment" {
   policy_arn = aws_iam_policy.s3_access_policy.arn
@@ -297,6 +342,42 @@ resource "aws_iam_instance_profile" "ec2_profile" {
   name = "EC2-S3-Profile"
   role = aws_iam_role.ec2_s3_access_role.name
 }
+# KMS Key for EC2
+resource "aws_kms_key" "ec2_key" {
+  description             = "KMS key for EC2 instances"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
+  rotation_period_in_days = 90
+
+  tags = {
+    Name = "csye6225-ec2-kms-key"
+  }
+}
+
+# KMS Key for RDS
+resource "aws_kms_key" "rds_key" {
+  description             = "KMS key for RDS instances"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
+  rotation_period_in_days = 90
+
+  tags = {
+    Name = "csye6225-rds-kms-key"
+  }
+}
+
+# KMS Key for S3
+resource "aws_kms_key" "s3_key" {
+  description             = "KMS key for S3 buckets"
+  deletion_window_in_days = 10
+  enable_key_rotation     = true
+  rotation_period_in_days = 90
+
+  tags = {
+    Name = "csye6225-s3-kms-key"
+  }
+}
+
 # SNS Topic for user registration
 resource "aws_sns_topic" "user_registration" {
   name = "user-registration-topic"
@@ -313,15 +394,38 @@ resource "aws_lambda_function" "email_verification" {
 
   environment {
     variables = {
-      DB_HOST         = aws_db_instance.db_instance.address
-      DB_USER         = var.db_username
-      DB_PASSWORD     = var.db_password
-      DB_NAME         = var.db_name
-      MAILGUN_API_KEY = var.mailgun_api_key
-      MAILGUN_DOMAIN  = var.mailgun_domain
+      MAILGUN_API_KEY = aws_secretsmanager_secret.email_credentials.name
       SNS_TOPIC_ARN   = aws_sns_topic.user_registration.arn
     }
   }
+}
+resource "aws_iam_policy" "kms_access_policy" {
+  name        = "KMS-Access-Policy"
+  description = "Policy for EC2 to access KMS keys"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:Encrypt",
+          "kms:Decrypt",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:DescribeKey"
+        ]
+        Resource = [
+          "*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "kms_access_attachment" {
+  policy_arn = aws_iam_policy.kms_access_policy.arn
+  role       = aws_iam_role.ec2_s3_access_role.name
 }
 
 # IAM Role for Lambda
@@ -340,6 +444,78 @@ resource "aws_iam_role" "lambda_exec" {
       }
     ]
   })
+}
+
+resource "aws_iam_policy" "secret_manager_policy" {
+  name        = "ec2-secret-manager-access"
+  description = "IAM policy for ec2 to access SM"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+        ]
+        Resource = [
+          aws_secretsmanager_secret.db_password.arn,
+          aws_secretsmanager_secret.email_credentials.arn
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+          "kms:Encrypt",
+          "kms:DescribeSecret"
+        ]
+        Resource = [
+          aws_kms_key.secret_manager_key.arn,
+          aws_kms_key.email_service_key.arn
+        ]
+      }
+    ]
+  })
+}
+resource "aws_iam_policy" "lambda_secrets_policy" {
+  name        = "lambda-secrets-policy"
+  description = "IAM policy for Lambda to access Secrets Manager"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+        ]
+        Resource = [
+          aws_secretsmanager_secret.db_password.arn,
+          aws_secretsmanager_secret.email_credentials.arn
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "kms:Decrypt",
+          "kms:Encrypt",
+          "kms:DescribeSecret"
+        ]
+        Resource = [
+          aws_kms_key.secret_manager_key.arn,
+          aws_kms_key.email_service_key.arn
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2-secret-policy_attachment" {
+  policy_arn = aws_iam_policy.secret_manager_policy.arn
+  role       = aws_iam_role.ec2_s3_access_role.name
+}
+resource "aws_iam_role_policy_attachment" "lambda_secrets_policy_attachment" {
+  policy_arn = aws_iam_policy.lambda_secrets_policy.arn
+  role       = aws_iam_role.lambda_exec.name
 }
 
 # IAM Policy for Lambda
@@ -400,13 +576,36 @@ resource "aws_launch_template" "app_launch_template" {
   iam_instance_profile {
     name = aws_iam_instance_profile.ec2_profile.name
   }
+  # block_device_mappings {
+  #   device_name = "/dev/sda1"
+  #   ebs {
+  #     volume_size           = 25
+  #     volume_type           = "gp2"
+  #     delete_on_termination = true
+  #     encrypted             = true
+  #     kms_key_id            = aws_kms_key.ec2_key.arn
+  #   }
+  # }
+  # depends_on = [
+  #   aws_kms_key.ec2_key
+  # ]
 
   user_data = base64encode(<<-EOF
               #!/bin/bash
+              # Update system and install necessary packages
+              sudo apt-get update
+              sudo apt-get install -y unzip curl
+              # Download and install AWS CLI v2
+              curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+              unzip awscliv2.zip
+              sudo ./aws/install
+              # Check AWS CLI installation
+              aws --version
               DB_HOST=$(echo "${aws_db_instance.db_instance.address}")
               echo "DB_HOST=$DB_HOST" >> /opt/app/.env
               echo "DB_USER=${var.db_username}" >> /opt/app/.env
-              echo "DB_PASSWORD=${var.db_password}" >> /opt/app/.env
+              DB_PASSWORD=$(aws secretsmanager get-secret-value --secret-id "new-csye6225-db-password6" --query 'SecretString' --output text)
+              echo "DB_PASSWORD=$DB_PASSWORD" >> /opt/app/.env
               echo "DB_NAME=${var.db_name}" >> /opt/app/.env
               echo "DB_DIALECT=mysql" >> /opt/app/.env
               echo "PORT=8080" >> /opt/app/.env
@@ -414,7 +613,8 @@ resource "aws_launch_template" "app_launch_template" {
               echo "S3_BUCKET_URL=https://${aws_s3_bucket.app_bucket.bucket_regional_domain_name}" >> /opt/app/.env
               echo "AWS_REGION=${var.region}" >> /opt/app/.env
               echo "SNS_TOPIC_ARN=${aws_sns_topic.user_registration.arn}" >> /opt/app/.env
-              echo "MAILGUN_API_KEY=${var.mailgun_api_key}" >> /opt/app/.env
+              MAILGUN_API_KEY=$(aws secretsmanager get-secret-value --secret-id "new-csye6225-email-credentials6" --query 'SecretString' --output text)
+              echo "MAILGUN_API_KEY=$MAILGUN_API_KEY" >> /opt/app/.env
               echo "MAILGUN_DOMAIN=${var.mailgun_domain}" >> /opt/app/.env
               chmod 644 /opt/app/.env
               export $(grep -v '^#' /opt/app/.env | xargs)
@@ -567,10 +767,16 @@ resource "aws_lb_target_group" "app_tg" {
   }
 }
 
+data "aws_acm_certificate" "issued" {
+  domain   = var.domain_name
+  statuses = ["ISSUED"]
+}
 resource "aws_lb_listener" "app_listener" {
   load_balancer_arn = aws_lb.app_lb.arn
-  port              = 80
-  protocol          = "HTTP"
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-2016-08"
+  certificate_arn   = data.aws_acm_certificate.issued.arn
 
   default_action {
     type             = "forward"
@@ -590,16 +796,16 @@ resource "aws_route53_record" "app_dns" {
     evaluate_target_health = true
   }
 }
-# DKIM TXT Record for email validation
-resource "aws_route53_record" "dkim" {
-  zone_id = var.route53_zone_id
-  name    = "mailo._domainkey.${var.domain_name}"
-  type    = "TXT"
-  ttl     = 300
-  records = [
-    "k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCqJuOCyceEXAS2SwmuK/TQGVzdUaoBk0Mdb6PCwLISHuPz08p8TwJPsTJeUzkrq6Zb2oy9VcjozFx/+cfcKOnXsfDGYG6HmehPZz74jMcpq2SHjyTY5LbSpTDKmga9R8ewc/IoHk6jUcD7nXnW6ea4p+HVXoUI5L6uO7i7LKPQpwIDAQAB"
-  ]
-}
+# # DKIM TXT Record for email validation
+# resource "aws_route53_record" "dkim" {
+#   zone_id = var.route53_zone_id
+#   name    = "mailo._domainkey.${var.domain_name}"
+#   type    = "TXT"
+#   ttl     = 300
+#   records = [
+#     "k=rsa; p=MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCqJuOCyceEXAS2SwmuK/TQGVzdUaoBk0Mdb6PCwLISHuPz08p8TwJPsTJeUzkrq6Zb2oy9VcjozFx/+cfcKOnXsfDGYG6HmehPZz74jMcpq2SHjyTY5LbSpTDKmga9R8ewc/IoHk6jUcD7nXnW6ea4p+HVXoUI5L6uO7i7LKPQpwIDAQAB"
+#   ]
+# }
 
 # SPF TXT Record for email sender policy
 resource "aws_route53_record" "spf" {
@@ -634,6 +840,16 @@ resource "aws_route53_record" "email_cname" {
     "mailgun.org"
   ]
 }
+# resource "aws_route53_record" "ssl_cname" {
+#   zone_id = var.route53_zone_id
+#   name    = "_4c1b455ce39586c08892b716e7a48979.dev.saurabhprojects.me"
+#   type    = "CNAME"
+#   ttl     = 300
+#   records = [
+#     "AD53B295043CA73F1AC63A81A08098CB.DCD7026B4CFE6E17B80FC84A2D4BE629.572d5c8bd342d4b.comodoca.com"
+#   ]
+# }
+
 
 # RDS Parameter Group
 resource "aws_db_parameter_group" "db_param_group" {
@@ -676,7 +892,8 @@ resource "aws_db_instance" "db_instance" {
   publicly_accessible    = false
   skip_final_snapshot    = true
   multi_az               = false
-
+  storage_encrypted      = true
+  kms_key_id             = aws_kms_key.rds_key.arn
   tags = {
     Name = "csye6225-db-instance"
   }
